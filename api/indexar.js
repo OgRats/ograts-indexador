@@ -6,17 +6,29 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con la API oficial de Ronin Chain...");
+        console.log("⏳ Conectando con el nodo RPC oficial de Ronin...");
         
-        // Vercel usa IPs limpias, por lo que el nodo de Ronin nos responderá a la primera
-        const urlRonin = `https://app.roninchain.com/api/token/nft/${contratoOgRats}/holders?limit=50`;
+        // Usamos la API RPC estándar que no bloquea a Vercel
+        const urlRonin = "https://api-gateway.skymavis.com/rpc";
 
         const response = await fetch(urlRonin, {
-            method: "GET",
+            method: "POST",
             headers: { 
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            }
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_call",
+                params: [
+                    {
+                        to: contratoOgRats,
+                        data: "0x70a0823100000000000000000000000000000000000000000000000000000000" 
+                    },
+                    "latest"
+                ]
+            })
         });
 
         if (!response.ok) {
@@ -87,4 +99,3 @@ export default async function handler(req, res) {
         return res.status(500).json({ success: false, error: error.message });
     }
 }
-
