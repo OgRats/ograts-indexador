@@ -1,73 +1,86 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
-const contratoOgRats = "0x953e34637cc596b8195eb7fb83305402d3b9d000";
+const contratoOgRats = "0x953e34637cc596b8195eb7fb83305402d3b9d000"; 
 
 export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        if (!OPENSEA_API_KEY) {
-            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel");
+        console.log("⏳ Conectando al nodo nativo de Ronin Chain...");
+        
+        // Usamos el endpoint RPC oficial y estable de la red Ronin
+        const urlRonin = "https://api.roninchain.com/rpc";
+
+        // Consultamos los Logs usando un rango de bloques seguro en formato hexadecimal estándar
+        const responseRpc = await fetch(urlRonin, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getLogs",
+                params: [{
+                    address: contratoOgRats,
+                    fromBlock: "0x1B00000", // Rango amplio pero seguro para evitar saturar el nodo público
+                    toBlock: "latest",
+                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Evento Transfer(address,address,uint256)
+                }]
+            })
+        });
+
+        if (!responseRpc.ok) {
+            throw new Error(`El nodo de Ronin no responde. Código: ${responseRpc.status}`);
         }
 
-        // Controlamos el rango por URL. Ej: /api/indexar?desde=1
-        const desde = parseInt(req.query.desde) || 1;
-        const limite = 12; // Lote pequeño para ganarle al Timeout de Vercel
-        const hasta = desde + limite - 1;
+        const jsonRpc = await responseRpc.json();
+        
+        if (jsonRpc.error) {
+            throw new Error(`Error devuelto por el nodo: ${jsonRpc.error.message}`);
+        }
 
-        console.log(`⏳ Analizando dueños reales desde token #${desde} hasta #${hasta}...`);
+        const logs = jsonRpc.result || [];
+
+        if (logs.length === 0) {
+            throw new Error("No se detectaron transferencias en la blockchain para este contrato en el rango de bloques.");
+        }
+
         let snapshotActual = {};
 
-        // Peticiones individuales controladas
-        for (let id = desde; id <= hasta; id++) {
-            const url = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts/${id}`;
-            
-            const response = await fetch(url, {
-                method: "GET",
-                headers: { "Accept": "application/json", "X-API-KEY": OPENSEA_API_KEY }
-            });
+        // Procesamos el historial real de la red para calcular los balances netos exactos
+        logs.forEach(log => {
+            if (log.topics.length >= 4) {
+                // Limpiamos los paddings de ceros para extraer las wallets reales
+                const de = "0x" + log.topics[1].slice(26).toLowerCase();
+                const para = "0x" + log.topics[2].slice(26).toLowerCase();
 
-            if (response.ok) {
-                const nftData = await response.json();
-                
-                // Estructura exacta validada por tu captura anterior
-                const ownerObj = nftData.nft?.owner;
-                const wallet = (typeof ownerObj === 'string' ? ownerObj : ownerObj?.address || "") .toLowerCase();
-                const username = ownerObj?.username || null;
-
-                if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
-                    if (!snapshotActual[wallet]) {
-                        snapshotActual[wallet] = { balance: 0, username: username };
-                    }
-                    snapshotActual[wallet].balance += 1;
+                // Sumamos 1 NFT al que recibe la transferencia
+                if (para !== "0x0000000000000000000000000000000000000000") {
+                    snapshotActual[para] = (snapshotActual[para] || 0) + 1;
+                }
+                // Restamos 1 NFT al que envía o transfiere la pieza
+                if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
+                    snapshotActual[de] = Math.max(0, snapshotActual[de] - 1);
+                    if (snapshotActual[de] === 0) delete snapshotActual[de];
                 }
             }
-            // Pausa milimétrica para evitar baneos de Rate Limit
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
+        });
 
-        const totalWallets = Object.keys(snapshotActual).length;
-        if (totalWallets === 0) {
-            return res.status(200).json({
-                success: true,
-                message: `Lote analizado (${desde}-${hasta}), pero no se encontraron transacciones activas en este fragmento.`
-            });
-        }
-
-        // Preparación limpia de datos para tu Supabase
+        // Formateamos la lista de holders para tu tabla de Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: info.username,
-                balance: info.balance,
-                puntos: info.balance, // 1 NFT = 1 Punto
+                username: null, // El frontend se encargará de renderizar la wallet de forma estética
+                balance: snapshotActual[wallet],
+                puntos: snapshotActual[wallet], // 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Inserción acumulativa con merge de duplicados
+        if (filasAInsertar.length === 0) {
+            throw new Error("El procesamiento de balances netos resultó en 0 holders activos.");
+        }
+
+        // Subida masiva limpia con resolución de duplicados en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -81,15 +94,13 @@ export default async function handler(req, res) {
 
         if (!resInsert.ok) {
             const txtErr = await resInsert.text();
-            throw new Error(`Supabase rechazó guardar: ${txtErr}`);
+            throw new Error(`Supabase rechazó la inserción masiva: ${txtErr}`);
         }
 
         return res.status(200).json({
             success: true,
-            message: `¡Lote verificado e insertado correctamente en Supabase!`,
-            rango_analizado: `${desde} al ${hasta}`,
-            owners_reales_detectados: totalWallets,
-            siguiente_lote_url: `https://ograts-indexador.vercel.app/api/indexar?desde=${hasta + 1}`
+            message: "¡Rehecho con éxito! Sincronización limpia completada desde la blockchain de Ronin.",
+            total_holders_reales: filasAInsertar.length
         });
 
     } catch (error) {
