@@ -6,10 +6,10 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con el nodo RPC oficial de Ronin...");
+        console.log("⏳ Conectando con nodo público Ronin...");
         
-        // Usamos la API RPC estándar que no bloquea a Vercel
-        const urlRonin = "https://api-gateway.skymavis.com/rpc";
+        // Cambiamos a un nodo público abierto que no requiere API Key (código 401)
+        const urlRonin = "https://ronin.api.slingshot.finance/v1/rpc";
 
         const response = await fetch(urlRonin, {
             method: "POST",
