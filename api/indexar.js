@@ -1,80 +1,81 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        if (!OPENSEA_API_KEY) {
-            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
-        }
+        console.log("⏳ Conectando directamente a la Blockchain de Ronin...");
+        const urlRonin = "https://api.roninchain.com/rpc";
 
-        console.log("⏳ Consultando el listado directo de dueños de la colección en OpenSea...");
-        
-        // Endpoint v2 oficial de OpenSea exclusivo para listar los dueños (owners) de una colección
-        const urlOpenSea = "https://api.opensea.io/api/v2/collections/ograts/owners?limit=150";
-        
-        const responseOS = await fetch(urlOpenSea, {
-            method: "GET",
-            headers: { 
-                "Accept": "application/json",
-                "X-API-KEY": OPENSEA_API_KEY
-            }
+        // Consultamos los Logs de transferencia (Transfer) desde un bloque seguro en la historia de Ronin
+        const responseRpc = await fetch(urlRonin, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getLogs",
+                params: [{
+                    address: contratoOgRats,
+                    fromBlock: "0x1B20000", // Bloque aproximado de lanzamiento para optimizar la velocidad del nodo
+                    toBlock: "latest",
+                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Evento Transfer(address,address,uint256)
+                }]
+            })
         });
 
-        if (!responseOS.ok) {
-            throw new Error(`OpenSea API respondió con código: ${responseOS.status}`);
+        if (!responseRpc.ok) {
+            throw new Error(`El nodo de Ronin no responde (Código ${responseRpc.status}). Inténtalo de nuevo en unos segundos.`);
         }
 
-        const jsonOS = await responseOS.json();
-        
-        // La API v2 para este endpoint devuelve la lista dentro de jsonOS.owners
-        const ownersList = jsonOS.owners || [];
-        
-        if (ownersList.length === 0) {
-            throw new Error("OpenSea respondió 200, pero la lista 'owners' vino vacía. Comprueba el slug de la colección.");
+        const jsonRpc = await responseRpc.json();
+        const logs = jsonRpc.result || [];
+
+        if (logs.length === 0) {
+            throw new Error("El nodo respondió bien, pero no se detectaron movimientos en este rango de bloques.");
         }
 
         let snapshotActual = {};
 
-        // Recorremos la lista estructurada de dueños que devuelve OpenSea
-        ownersList.forEach(ownerData => {
-            // En este endpoint, la wallet viene directo en ownerData.owner o ownerData.address
-            const wallet = (ownerData.owner || ownerData.address || "").toLowerCase();
-            const cantidad = parseInt(ownerData.quantity || 0);
-            
-            if (wallet && wallet !== "0x0000000000000000000000000000000000000000" && cantidad > 0) {
-                // OpenSea asocia el nombre de usuario de la cuenta si existe
-                const username = ownerData.username || null;
+        // Procesamos el historial de transferencias para calcular los balances reales exactos
+        logs.forEach(log => {
+            if (log.topics.length >= 4) {
+                // Limpiamos los ceros de las direcciones hexadecimales para obtener las wallets reales
+                const de = "0x" + log.topics[1].slice(26).toLowerCase();
+                const para = "0x" + log.topics[2].slice(26).toLowerCase();
 
-                if (!snapshotActual[wallet]) {
-                    snapshotActual[wallet] = {
-                        balance: 0,
-                        username: username
-                    };
+                // Si alguien recibe el NFT, se le suma 1 a su balance
+                if (para !== "0x0000000000000000000000000000000000000000") {
+                    if (!snapshotActual[para]) snapshotActual[para] = 0;
+                    snapshotActual[para] += 1;
                 }
-                snapshotActual[wallet].balance += cantidad;
+                // Si alguien envía el NFT, se le resta 1 de su balance
+                if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
+                    snapshotActual[de] = Math.max(0, snapshotActual[de] - 1);
+                    if (snapshotActual[de] === 0) delete snapshotActual[de];
+                }
             }
         });
 
-        if (Object.keys(snapshotActual).length === 0) {
-            throw new Error("No se pudieron mapear los campos 'owner' o 'quantity' de la respuesta.");
-        }
-
-        // Formateamos las filas idénticas para Supabase
+        // Formateamos las filas mapeando address, balance y puntos (1 NFT = 1 Punto)
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const info = snapshotActual[wallet];
+            const balanceNfts = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: info.username, 
-                balance: info.balance,
-                puntos: info.balance, // Regla de oro: 1 NFT = 1 Punto
+                username: null, // Las wallets se formatearán de forma elegante en tu frontend
+                balance: balanceNfts,
+                puntos: balanceNfts,
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Insertamos o actualizamos de golpe en Supabase
+        if (filasAInsertar.length === 0) {
+            throw new Error("No se generaron registros de holders activos.");
+        }
+
+        // Subimos toda la lista real procesada a Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -91,10 +92,10 @@ export default async function handler(req, res) {
             throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
         }
 
-        return res.status(200).json({ 
-            success: true, 
-            message: "¡Sincronización real de holders completada!",
-            holders_actualizados: filasAInsertar.length
+        return res.status(200).json({
+            success: true,
+            message: "¡Sincronización real completada directamente desde la Blockchain de Ronin!",
+            holders_totales: filasAInsertar.length
         });
 
     } catch (error) {
