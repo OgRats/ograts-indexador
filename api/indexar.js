@@ -1,69 +1,74 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
-    const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
-    let snapshotActual = {};
-
     try {
-        console.log("⏳ Conectando directamente al nodo RPC de Ronin...");
-        const urlRonin = "https://api.roninchain.com/rpc";
-        
-        // Pedimos logs en un rango intermedio para no saturar el nodo público
-        const responseRpc = await fetch(urlRonin, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                jsonrpc: "2.0", id: 1, method: "eth_getLogs",
-                params: [{
-                    address: contratoOgRats,
-                    fromBlock: "0x1cb4c00", // Bloque estimado para optimizar la búsqueda
-                    toBlock: "latest",
-                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Transferencias
-                }]
-            })
-        });
+        const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        if (!responseRpc.ok) throw new Error(`Nodo Ronin caído o saturado: ${responseRpc.status}`);
-        
-        const jsonRpc = await responseRpc.json();
-        const logs = jsonRpc.result || [];
-        
-        if (logs.length === 0) {
-            throw new Error("El nodo respondió, pero no encontró transferencias en este rango de bloques.");
+        if (!OPENSEA_API_KEY) {
+            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel");
         }
 
-        // Procesamos transferencias reales
-        logs.forEach(log => {
-            if (log.topics.length >= 4) {
-                const de = "0x" + log.topics[1].slice(26).toLowerCase();
-                const para = "0x" + log.topics[2].slice(26).toLowerCase();
-                
-                if (para !== "0x0000000000000000000000000000000000000000") {
-                    if (!snapshotActual[para]) snapshotActual[para] = { balance: 0 };
-                    snapshotActual[para].balance += 1;
-                }
-                if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
-                    snapshotActual[de].balance = Math.max(0, snapshotActual[de].balance - 1);
-                    if (snapshotActual[de].balance === 0) delete snapshotActual[de];
-                }
+        console.log("⏳ Consultando holders reales en OpenSea v2...");
+        
+        // Petición estándar v2 de OpenSea para traer los NFTs activos de un contrato en Ronin
+        const urlOpenSea = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts?limit=100`;
+
+        const responseOS = await fetch(urlOpenSea, {
+            method: "GET",
+            headers: { 
+                "Accept": "application/json",
+                "X-API-KEY": OPENSEA_API_KEY
             }
         });
 
-        // Formateamos para Supabase (Sin trucos, directo lo que de la blockchain)
+        if (!responseOS.ok) {
+            throw new Error(`OpenSea respondió con código: ${responseOS.status}`);
+        }
+
+        const jsonOS = await responseOS.json();
+        const nfts = jsonOS.nfts || [];
+        
+        let snapshotActual = {};
+
+        // Agrupamos los NFTs por billetera y guardamos el username si existe
+        nfts.forEach(nft => {
+            const wallet = (nft.owner || "").toLowerCase();
+            
+            if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
+                // Buscamos el nombre de usuario de OpenSea si viene disponible
+                let username = null;
+                if (nft.creator_username) username = nft.creator_username;
+
+                if (!snapshotActual[wallet]) {
+                    snapshotActual[wallet] = {
+                        balance: 0,
+                        username: username
+                    };
+                }
+                snapshotActual[wallet].balance += 1;
+            }
+        });
+
+        if (Object.keys(snapshotActual).length === 0) {
+            throw new Error("No se encontraron piezas o dueños en la respuesta.");
+        }
+
+        // Mapeamos los datos limpios para Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
+            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: null,
-                balance: snapshotActual[wallet].balance,
-                puntos: snapshotActual[wallet].balance, // 1 NFT = 1 Punto
+                username: info.username, 
+                balance: info.balance,
+                puntos: info.balance, // Regla fija: 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        if (filasAInsertar.length === 0) throw new Error("No hay holders reales calculados en este lote.");
-
+        // Guardamos todo en la base de datos reemplazando duplicados
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -75,12 +80,15 @@ export default async function handler(req, res) {
             body: JSON.stringify(filasAInsertar)
         });
 
-        if (!resInsert.ok) throw new Error("Supabase rechazó la inserción.");
+        if (!resInsert.ok) {
+            const errTxt = await resInsert.text();
+            throw new Error(`Supabase rechazó la inserción: ${errTxt}`);
+        }
 
-        return res.status(200).json({
-            success: true,
-            message: `¡Datos reales sincronizados directamente desde la Blockchain!`,
-            holders_actualizados: filasAInsertar.length
+        return res.status(200).json({ 
+            success: true, 
+            message: `¡Sincronización real completada con OpenSea!`,
+            total_holders: filasAInsertar.length
         });
 
     } catch (error) {
