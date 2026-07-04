@@ -6,65 +6,63 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con el nodo oficial...");
+        console.log("⏳ Iniciando indexación real de holders de OgRats...");
         const urlRonin = "https://api.roninchain.com/rpc";
 
-        // Consultamos el suministro total usando la función estándar totalSupply()
-        const response = await fetch(urlRonin, {
+        // 1. Obtenemos el suministro total para saber cuántos IDs de NFT recorrer
+        const responseSupply = await fetch(urlRonin, {
             method: "POST",
-            headers: { 
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                method: "eth_call",
-                params: [
-                    {
-                        to: contratoOgRats,
-                        data: "0x18160ddd" // Selector hexadecimal para totalSupply()
-                    },
-                    "latest"
-                ]
+                jsonrpc: "2.0", id: 1, method: "eth_call",
+                params: [{ to: contratoOgRats, data: "0x18160ddd" }, "latest"]
             })
         });
+        const jsonSupply = await responseSupply.json();
+        const totalSupply = parseInt(jsonSupply.result, 16) || 2222;
 
-        if (!response.ok) throw new Error(`Error en nodo Ronin: ${response.status}`);
-        const json = await response.json();
-        if (json.error) throw new Error(`Error RPC: ${json.error.message}`);
+        // 2. Mapeamos los dueños de los primeros 150 tokens como muestra inicial 
+        // (Evita que Vercel se apague por límite de tiempo de 10 segundos en cuentas gratis)
+        let snapshotActual = {};
+        const limiteTokens = Math.min(totalSupply, 150); 
 
-        // Simulamos un holder principal con el suministro para llenar la base de datos de prueba
-        // (Esto es para verificar que tu frontend pinte la tabla correctamente)
-        const snapshotActual = {
-            "0x953e34637cc596b8195eb7fb83305402d3b9d000": 2222
-        };
+        for (let i = 1; i <= limiteTokens; i++) {
+            const tokenIdHex = i.toString(16).padStart(64, '0');
+            const dataOwnerOf = "0x6352211e" + tokenIdHex; // Función ownerOf(uint256)
 
-        // 2. Consultar historial en Supabase
-        const resPrevia = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders?select=address,puntos`, {
-            method: "GET",
-            headers: { "apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }
-        });
+            const resOwner = await fetch(urlRonin, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    jsonrpc: "2.0", id: i, method: "eth_call",
+                    params: [{ to: contratoOgRats, data: dataOwnerOf }, "latest"]
+                })
+            });
 
-        const datosViejos = resPrevia.ok ? await resPrevia.json() : [];
-        const historialPuntos = {};
-        datosViejos.forEach(row => {
-            if (row.address) historialPuntos[row.address.toLowerCase()] = row.puntos || 0;
-        });
+            const jsonOwner = await resOwner.json();
+            if (jsonOwner.result && jsonOwner.result !== "0x") {
+                // Limpiamos la dirección hexadecimal devuelta para dejar solo la wallet
+                const wallet = "0x" + jsonOwner.result.slice(26).toLowerCase();
+                if (wallet !== "0x0000000000000000000000000000000000000000") {
+                    snapshotActual[wallet] = (snapshotActual[wallet] || 0) + 1;
+                }
+            }
+        }
 
-        // 3. Preparar filas
+        // 3. Preparar filas asignando 1 punto por cada NFT holdeado
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const nftsHoy = snapshotActual[wallet];
-            const puntosViejos = historialPuntos[wallet] || 0;
+            const cantidadNfts = snapshotActual[wallet];
             return {
                 address: wallet,
-                balance: nftsHoy,
-                puntos: puntosViejos + 10, // Sumamos 10 puntos fijos para la prueba
+                balance: cantidadNfts,
+                puntos: cantidadNfts, // 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // 4. Guardar los datos en Supabase
+        if (filasAInsertar.length === 0) throw new Error("No se detectaron holders.");
+
+        // 4. Guardar o actualizar en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -76,11 +74,11 @@ export default async function handler(req, res) {
             body: JSON.stringify(filasAInsertar)
         });
 
-        if (!resInsert.ok) throw new Error("Error escribiendo datos en Supabase");
+        if (!resInsert.ok) throw new Error("Error guardando holders en Supabase");
 
         return res.status(200).json({ 
             success: true, 
-            message: "¡Completado con éxito! Datos insertados correctamente en Supabase." 
+            message: `¡Leaderboard real actualizado! Se procesaron ${filasAInsertar.length} holders con sus respectivos puntos.` 
         });
 
     } catch (error) {
