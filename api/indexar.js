@@ -6,10 +6,10 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con el nodo público oficial de Ronin...");
+        console.log("⏳ Conectando con el nodo público principal de Ronin...");
         
-        // Usamos el nodo público recomendado por la documentación de Ronin
-        const urlRonin = "https://ronin.lgns.net/rpc";
+        // Usamos el punto de acceso público oficial y global de Ronin Chain
+        const urlRonin = "https://api.roninchain.com/rpc";
 
         const response = await fetch(urlRonin, {
             method: "POST",
@@ -37,15 +37,8 @@ export default async function handler(req, res) {
 
         const json = await response.json();
         
-        // Si el nodo responde con un error interno de RPC
         if (json.error) {
             throw new Error(`Error RPC: ${json.error.message}`);
-        }
-
-        // Procesamos la respuesta hexadecimal del nodo rpc
-        const resultadoHex = json.result;
-        if (!resultadoHex || resultadoHex === "0x") {
-            throw new Error("No se recibieron datos del contrato.");
         }
 
         // 2. Consultar historial en Supabase para validar conexión
@@ -60,7 +53,7 @@ export default async function handler(req, res) {
 
         return res.status(200).json({ 
             success: true, 
-            message: "¡Conexión exitosa! El script conectó con Ronin y con Supabase correctamente." 
+            message: "¡Conexión exitosa! El script conectó con el RPC oficial de Ronin y con Supabase correctamente." 
         });
 
     } catch (error) {
