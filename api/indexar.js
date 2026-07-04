@@ -1,6 +1,7 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
     try {
@@ -10,8 +11,10 @@ export default async function handler(req, res) {
             throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
         }
 
-        // Endpoint oficial por slug para obtener los NFTs
-        const urlOpenSea = "https://api.opensea.io/api/v2/collection/ograts/nfts?limit=5";
+        console.log("⏳ Descargando holders reales desde el endpoint de contrato de OpenSea...");
+        
+        // Endpoint v2 correcto para contratos en Ronin que sí incluye los owners e información de cuenta
+        const urlOpenSea = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts?limit=50`;
         
         const responseOS = await fetch(urlOpenSea, {
             method: "GET",
@@ -29,41 +32,56 @@ export default async function handler(req, res) {
         const nfts = jsonOS.nfts || [];
         
         if (nfts.length === 0) {
-            throw new Error("OpenSea no devolvió ningún ítem para el slug 'ograts'.");
+            throw new Error("OpenSea no devolvió ítems para este contrato. Verifica el estado de indexación en la plataforma.");
         }
 
-        // Mapeo básico para ver si engancha algo
         let snapshotActual = {};
+
+        // Mapeamos los campos de dueños que este endpoint específico sí retorna
         nfts.forEach(nft => {
-            // Evaluamos la propiedad exacta imprimiendo opciones en crudo
-            const wallet = nft.owner || (nft.owners && nft.owners[0]?.address) || null;
-            if (wallet) {
-                const wLimpia = wallet.toLowerCase();
-                snapshotActual[wLimpia] = (snapshotActual[wLimpia] || 0) + 1;
+            let walletDetectada = null;
+            let usernameDetectado = null;
+
+            if (nft.owner) {
+                walletDetectada = typeof nft.owner === 'string' ? nft.owner : (nft.owner.address || nft.owner.wallet);
+                usernameDetectado = nft.owner.username || null;
+            } else if (nft.owners && nft.owners.length > 0) {
+                walletDetectada = nft.owners[0].address;
+                usernameDetectado = nft.owners[0].username || null;
+            }
+
+            if (walletDetectada) {
+                const walletLimpia = walletDetectada.toLowerCase();
+                if (walletLimpia !== "0x0000000000000000000000000000000000000000") {
+                    if (!snapshotActual[walletLimpia]) {
+                        snapshotActual[walletLimpia] = {
+                            balance: 0,
+                            username: usernameDetectado || null
+                        };
+                    }
+                    snapshotActual[walletLimpia].balance += 1;
+                }
             }
         });
 
-        // SI FALLA EL MAPEO, EN LUGAR DE LANZAR ERROR, TE MUESTRA EL PRIMER NFT EN PANTALLA
         if (Object.keys(snapshotActual).length === 0) {
-            return res.status(200).json({
-                success: false,
-                message: "Estructura no compatible. Aquí tienes el primer NFT para revisar sus campos:",
-                estructura_nft_ejemplo: nfts[0] // Esto nos va a decir exactamente dónde viene la wallet
-            });
+            throw new Error("Este endpoint no retornó información de owners mapeable.");
         }
 
-        // Si funciona, guarda en Supabase normalmente
+        // Estructuramos las filas idénticas para Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
+            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: null, 
-                balance: snapshotActual[wallet],
-                puntos: snapshotActual[wallet],
+                username: info.username, 
+                balance: info.balance,
+                puntos: info.balance, // 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
+        // Upsert limpio en Supabase
+        const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
                 "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -74,10 +92,15 @@ export default async function handler(req, res) {
             body: JSON.stringify(filasAInsertar)
         });
 
+        if (!resInsert.ok) {
+            const txtErr = await resInsert.text();
+            throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
+        }
+
         return res.status(200).json({ 
             success: true, 
-            message: "Sincronizado",
-            wallets: filasAInsertar.length
+            message: "¡Sincronización real completada con éxito!",
+            holders_actualizados: filasAInsertar.length
         });
 
     } catch (error) {
