@@ -1,96 +1,67 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 
 export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        // Leemos desde qué NFT empezar usando un parámetro en la URL (?desde=1)
-        // Si no se pone nada, por defecto empieza desde el NFT #1
-        const desde = parseInt(req.query.desde) || 1;
-        const loteSize = 200; // Procesamos 200 tokens por tanda para no saturar
-        const hasta = desde + loteSize - 1;
-
-        console.log(`⏳ Escaneando tokens desde el #${desde} hasta el #${hasta} directamente en Ronin...`);
-        const urlRonin = "https://api.roninchain.com/rpc";
-
-        let llamadasRPC = [];
-        for (let i = desde; i <= hasta; i++) {
-            const tokenIdHex = i.toString(16).padStart(64, '0');
-            llamadasRPC.push({
-                jsonrpc: "2.0",
-                id: i,
-                method: "eth_call",
-                params: [{
-                    to: contratoOgRats,
-                    data: "0x6352211e" + tokenIdHex // Función ownerOf(uint256)
-                }, "latest"]
-            });
+        if (!OPENSEA_API_KEY) {
+            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel");
         }
 
-        // Hacemos la petición masiva en bloques de 50 para evitar el error 400 del nodo
-        let snapshotActual = {};
-        const tamañoSubLote = 50;
-
-        for (let j = 0; j < llamadasRPC.length; j += tamañoSubLote) {
-            const subLote = llamadasRPC.slice(j, j + tamañoSubLote);
-            const response = await fetch(urlRonin, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(subLote)
-            });
-
-            if (response.ok) {
-                const respuestas = await response.json();
-                if (Array.isArray(respuestas)) {
-                    respuestas.forEach(resRpc => {
-                        if (resRpc.result && resRpc.result !== "0x" && resRpc.result.length >= 66) {
-                            const wallet = "0x" + resRpc.result.slice(26).toLowerCase();
-                            if (wallet !== "0x0000000000000000000000000000000000000000") {
-                                snapshotActual[wallet] = (snapshotActual[wallet] || 0) + 1;
-                            }
-                        }
-                    });
-                }
-            }
-        }
-
-        const totalWalletsEncontradas = Object.keys(snapshotActual).length;
-        if (totalWalletsEncontradas === 0) {
-            throw new Error("El nodo no devolvió ningún dueño para este rango de tokens.");
-        }
-
-        // Consultamos qué datos ya teníamos en Supabase para no borrar los puntos acumulados
-        const resPrevia = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders?select=address,puntos,balance`, {
-            method: "GET",
-            headers: { "apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }
-        });
-        const datosViejos = resPrevia.ok ? await resPrevia.json() : [];
+        console.log("⏳ Extrayendo holders reales desde OpenSea API...");
         
-        let baseDeDatosMapeada = {};
-        datosViejos.forEach(row => {
-            if (row.address) baseDeDatosMapeada[row.address.toLowerCase()] = row;
+        // Usamos el endpoint oficial de OpenSea v2 para obtener los dueños de la colección completa por su SLUG
+        const urlOpenSea = `https://api.opensea.io/api/v2/collections/ograts/owners?limit=100`;
+
+        const responseOS = await fetch(urlOpenSea, {
+            method: "GET",
+            headers: { 
+                "Accept": "application/json",
+                "X-API-KEY": OPENSEA_API_KEY
+            }
         });
 
-        // Preparamos las filas unificando los balances reales actuales (1 NFT = 1 Punto)
+        if (!responseOS.ok) {
+            throw new Error(`OpenSea API respondió con código ${responseOS.status}`);
+        }
+
+        const jsonOS = await responseOS.json();
+        const owners = jsonOS.owners || [];
+        
+        let snapshotActual = {};
+
+        // OpenSea nos devuelve directamente la wallet y cuántos NFTs tiene de la colección
+        owners.forEach(item => {
+            const wallet = (item.address || "").toLowerCase();
+            const cantidadNfts = parseInt(item.quantity || 0);
+            
+            if (wallet && wallet !== "0x0000000000000000000000000000000000000000" && cantidadNfts > 0) {
+                snapshotActual[wallet] = {
+                    balance: cantidadNfts,
+                    username: item.username || null // Extrae el nombre de usuario de la cuenta si tiene
+                };
+            }
+        });
+
+        if (Object.keys(snapshotActual).length === 0) {
+            throw new Error("La API de OpenSea no devolvió dueños para el slug 'ograts'.");
+        }
+
+        // Armamos el paquete para Supabase: 1 NFT = 1 Punto
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const nftsDetectadosEnEsteLote = snapshotActual[wallet];
-            const registroPrevio = baseDeDatosMapeada[wallet] || { puntos: 0, balance: 0 };
-
-            // El balance nuevo será lo previo más lo que encontramos en este lote
-            const balanceFinal = registroPrevio.balance + nftsDetectadosEnEsteLote;
-
+            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: null, // Dejamos que el frontend pinte la wallet de forma limpia y pro
-                balance: balanceFinal,
-                puntos: balanceFinal, // REGLA: 1 NFT = 1 Punto real de balance
+                username: info.username, 
+                balance: info.balance,
+                puntos: info.balance, // REGLA: 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Guardamos todo de golpe usando un Upsert (merge) en Supabase
+        // Guardamos en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -109,7 +80,7 @@ export default async function handler(req, res) {
 
         return res.status(200).json({ 
             success: true, 
-            message: `¡Lote indexado con éxito! Analizados tokens del ${desde} al ${hasta}. Siguiente lote: ?desde=${hasta + 1}` 
+            message: `¡Sincronización completa! Se cargaron ${filasAInsertar.length} holders reales de la colección con sus balances y nombres.` 
         });
 
     } catch (error) {
