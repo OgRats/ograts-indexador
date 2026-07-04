@@ -7,10 +7,9 @@ export default async function handler(req, res) {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
         console.log("⏳ Conectando con el nodo público principal de Ronin...");
-        
-        // Usamos el punto de acceso público oficial y global de Ronin Chain
         const urlRonin = "https://api.roninchain.com/rpc";
 
+        // Consultamos el "totalSupply" (Total de NFTs emitidos) para verificar que el contrato responda bien
         const response = await fetch(urlRonin, {
             method: "POST",
             headers: { 
@@ -24,7 +23,8 @@ export default async function handler(req, res) {
                 params: [
                     {
                         to: contratoOgRats,
-                        data: "0x70a0823100000000000000000000000000000000000000000000000000000000" 
+                        // Código hexadecimal estándar para totalSupply()
+                        data: "0x18160ddd" 
                     },
                     "latest"
                 ]
@@ -41,7 +41,15 @@ export default async function handler(req, res) {
             throw new Error(`Error RPC: ${json.error.message}`);
         }
 
-        // 2. Consultar historial en Supabase para validar conexión
+        const resultadoHex = json.result;
+        if (!resultadoHex || resultadoHex === "0x") {
+            throw new Error("No se recibieron datos del contrato.");
+        }
+
+        // Convertimos el resultado hexadecimal a un número entero
+        const totalSupply = parseInt(resultadoHex, 16);
+
+        // 2. Simulamos la inserción o conectamos con Supabase para verificar que tus llaves sirvan
         const resPrevia = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders?select=address,puntos`, {
             method: "GET",
             headers: { "apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }
@@ -53,7 +61,7 @@ export default async function handler(req, res) {
 
         return res.status(200).json({ 
             success: true, 
-            message: "¡Conexión exitosa! El script conectó con el RPC oficial de Ronin y con Supabase correctamente." 
+            message: `¡Conexión exitosa! El contrato tiene un suministro de ${totalSupply} NFTs y tu Supabase está conectada correctamente.` 
         });
 
     } catch (error) {
