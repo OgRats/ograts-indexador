@@ -6,12 +6,10 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando al nodo nativo de Ronin Chain...");
-        
-        // Usamos el endpoint RPC oficial y estable de la red Ronin
+        console.log("⏳ Solicitando logs históricos con parámetros nativos de Ronin...");
         const urlRonin = "https://api.roninchain.com/rpc";
 
-        // Consultamos los Logs usando un rango de bloques seguro en formato hexadecimal estándar
+        // Usamos "earliest" y "latest" para cumplir con el validador estricto del nodo
         const responseRpc = await fetch(urlRonin, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -21,15 +19,15 @@ export default async function handler(req, res) {
                 method: "eth_getLogs",
                 params: [{
                     address: contratoOgRats,
-                    fromBlock: "0x1B00000", // Rango amplio pero seguro para evitar saturar el nodo público
+                    fromBlock: "earliest", 
                     toBlock: "latest",
-                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Evento Transfer(address,address,uint256)
+                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Evento Transfer
                 }]
             })
         });
 
         if (!responseRpc.ok) {
-            throw new Error(`El nodo de Ronin no responde. Código: ${responseRpc.status}`);
+            throw new Error(`Error de conexión con el nodo RPC. Código: ${responseRpc.status}`);
         }
 
         const jsonRpc = await responseRpc.json();
@@ -41,23 +39,20 @@ export default async function handler(req, res) {
         const logs = jsonRpc.result || [];
 
         if (logs.length === 0) {
-            throw new Error("No se detectaron transferencias en la blockchain para este contrato en el rango de bloques.");
+            throw new Error("No se encontraron eventos Transfer para este contrato en el historial accesible del nodo.");
         }
 
         let snapshotActual = {};
 
-        // Procesamos el historial real de la red para calcular los balances netos exactos
+        // Procesamos los logs de transferencia devueltos
         logs.forEach(log => {
             if (log.topics.length >= 4) {
-                // Limpiamos los paddings de ceros para extraer las wallets reales
                 const de = "0x" + log.topics[1].slice(26).toLowerCase();
                 const para = "0x" + log.topics[2].slice(26).toLowerCase();
 
-                // Sumamos 1 NFT al que recibe la transferencia
                 if (para !== "0x0000000000000000000000000000000000000000") {
                     snapshotActual[para] = (snapshotActual[para] || 0) + 1;
                 }
-                // Restamos 1 NFT al que envía o transfiere la pieza
                 if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
                     snapshotActual[de] = Math.max(0, snapshotActual[de] - 1);
                     if (snapshotActual[de] === 0) delete snapshotActual[de];
@@ -65,22 +60,21 @@ export default async function handler(req, res) {
             }
         });
 
-        // Formateamos la lista de holders para tu tabla de Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
             return {
                 address: wallet,
-                username: null, // El frontend se encargará de renderizar la wallet de forma estética
+                username: null, 
                 balance: snapshotActual[wallet],
-                puntos: snapshotActual[wallet], // 1 NFT = 1 Punto
+                puntos: snapshotActual[wallet],
                 updated_at: new Date().toISOString()
             };
         });
 
         if (filasAInsertar.length === 0) {
-            throw new Error("El procesamiento de balances netos resultó en 0 holders activos.");
+            throw new Error("No se generaron registros válidos tras procesar los balances.");
         }
 
-        // Subida masiva limpia con resolución de duplicados en Supabase
+        // Subida masiva de los datos procesados a Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -94,13 +88,13 @@ export default async function handler(req, res) {
 
         if (!resInsert.ok) {
             const txtErr = await resInsert.text();
-            throw new Error(`Supabase rechazó la inserción masiva: ${txtErr}`);
+            throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
         }
 
         return res.status(200).json({
             success: true,
-            message: "¡Rehecho con éxito! Sincronización limpia completada desde la blockchain de Ronin.",
-            total_holders_reales: filasAInsertar.length
+            message: "¡Mapeo completado directamente desde la Blockchain de Ronin!",
+            total_holders: filasAInsertar.length
         });
 
     } catch (error) {
