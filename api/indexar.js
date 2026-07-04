@@ -10,10 +10,10 @@ export default async function handler(req, res) {
             throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
         }
 
-        console.log("⏳ Descargando holders reales desde OpenSea por lote...");
+        console.log("⏳ Descargando catálogo real de la colección desde OpenSea...");
         
-        // Petición limpia por slug usando OpenSea V2 para traer los items
-        let urlOpenSea = "https://api.opensea.io/api/v2/collection/ograts/nfts?limit=50";
+        // Endpoint oficial por slug para obtener los NFTs activos de ograts
+        const urlOpenSea = "https://api.opensea.io/api/v2/collection/ograts/nfts?limit=50";
         
         const responseOS = await fetch(urlOpenSea, {
             method: "GET",
@@ -31,36 +31,54 @@ export default async function handler(req, res) {
         const nfts = jsonOS.nfts || [];
         
         if (nfts.length === 0) {
-            throw new Error("OpenSea conectó pero devolvió 0 NFTs para el slug 'ograts'.");
+            throw new Error("OpenSea no devolvió ningún ítem para el slug 'ograts'.");
         }
 
         let snapshotActual = {};
 
-        // Agrupamos el dueño y su cantidad (OpenSea v2 devuelve 'owners' dentro de cada NFT)
+        // Escáner profundo de dueños para la API v2 de OpenSea
         nfts.forEach(nft => {
-            // Evaluamos la estructura v2 de dueños por NFT
-            if (nft.owners && nft.owners.length > 0) {
-                nft.owners.forEach(ownerObj => {
-                    const wallet = (ownerObj.address || "").toLowerCase();
-                    const cantidad = parseInt(ownerObj.quantity || 1);
-                    
-                    if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
-                        if (!snapshotActual[wallet]) {
-                            snapshotActual[wallet] = { balance: 0, username: null };
-                        }
-                        snapshotActual[wallet].balance += cantidad;
+            let walletDetectada = null;
+            let usernameDetectado = null;
+
+            // Opción A: Viene dentro de la propiedad estándar 'owner'
+            if (nft.owner) {
+                walletDetectada = typeof nft.owner === 'string' ? nft.owner : (nft.owner.address || null);
+                usernameDetectado = nft.owner.username || null;
+            } 
+            // Opción B: Viene dentro de un arreglo 'owners' (Formato común en colecciones ERC-1155 o compartidas)
+            else if (nft.owners && nft.owners.length > 0) {
+                const primerDueno = nft.owners[0];
+                walletDetectada = primerDueno.address || null;
+                usernameDetectado = primerDueno.username || null;
+            }
+            // Opción C: Formato anidado de cuentas alternativas de OpenSea
+            else if (nft.creator) {
+                walletDetectada = nft.creator.address || null;
+                usernameDetectado = nft.creator.username || null;
+            }
+
+            // Si logramos capturar la wallet por cualquiera de las vías anteriores
+            if (walletDetectada) {
+                const walletLimpia = walletDetectada.toLowerCase();
+                // Ignoramos la dirección de quema nula (billetera muerta)
+                if (walletLimpia !== "0x0000000000000000000000000000000000000000") {
+                    if (!snapshotActual[walletLimpia]) {
+                        snapshotActual[walletLimpia] = {
+                            balance: 0,
+                            username: usernameDetectado || nft.creator_username || null
+                        };
                     }
-                });
-            } else if (nft.owner) { // Fallback si viene mapeado en singular
-                const wallet = nft.owner.toLowerCase();
-                if (wallet !== "0x0000000000000000000000000000000000000000") {
-                    if (!snapshotActual[wallet]) snapshotActual[wallet] = { balance: 0, username: null };
-                    snapshotActual[wallet].balance += 1;
+                    snapshotActual[walletLimpia].balance += 1;
                 }
             }
         });
 
-        // Formateamos las filas para que coincidan al 100% con tu base de datos de Supabase
+        if (Object.keys(snapshotActual).length === 0) {
+            throw new Error("El escáner no pudo mapear los campos de dueño de OpenSea. Formato de respuesta incompatible.");
+        }
+
+        // Formateamos las filas para que coincidan exactamente con tu tabla de Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
             const info = snapshotActual[wallet];
             return {
@@ -72,7 +90,7 @@ export default async function handler(req, res) {
             };
         });
 
-        // Upsert masivo en Supabase para machacar y actualizar balances sin duplicar addresses
+        // Guardamos todo de golpe machacando duplicados en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -86,12 +104,12 @@ export default async function handler(req, res) {
 
         if (!resInsert.ok) {
             const txtErr = await resInsert.text();
-            throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
+            throw new Error(`Supabase rechazó guardar los datos: ${txtErr}`);
         }
 
         return res.status(200).json({ 
             success: true, 
-            message: "¡Sincronización de lote real de OpenSea completada!",
+            message: "¡Sincronización real completada con OpenSea!",
             wallets_procesadas: filasAInsertar.length
         });
 
