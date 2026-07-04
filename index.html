@@ -64,11 +64,27 @@
     </div>
 
     <script>
+        // Credenciales oficiales y seguras de tu proyecto
+        const SUPABASE_URL = "https://bcclyutxzbbgvarypfwd.supabase.co"; 
+        const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJjY2x5dXR4emJiZ3ZhcnlwZndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMwOTY1NDksImV4cCI6MjA5ODY3MjU0OX0.4DUTMdbttMB-Yk25qB5rUlLkV0DgKDWNcuuwjI2rK6E";
+
         async function cargarLeaderboard() {
+            // Consulta directa ordenando por puntos de forma descendente
+            const urlFetch = `${SUPABASE_URL}/rest/v1/ograts_holders?select=*&order=puntos.desc`;
+
             try {
-                const response = await fetch('/api/ver-leaderboard');
-                const datos = await response.json();
+                const response = await fetch(urlFetch, {
+                    method: "GET",
+                    headers: {
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+                        "Content-Type": "application/json"
+                    }
+                });
+
+                if (!response.ok) throw new Error("Error conectando con Supabase");
                 
+                const datos = await response.json();
                 const tbody = document.getElementById('tabla-body');
                 tbody.innerHTML = '';
 
@@ -80,8 +96,9 @@
                 datos.forEach((user, index) => {
                     const fila = document.createElement('tr');
                     const walletCorta = user.address.substring(0, 6) + '...' + user.address.substring(user.address.length - 4);
-                    // Si viene un nombre desde la API lo usamos, si no, mostramos la wallet corta
-                    const nombreMostrar = user.username ? user.username : walletCorta;
+                    
+                    // Mostramos el username de OpenSea con un @ si existe, si no, la wallet acortada
+                    const nombreMostrar = user.username ? `@${user.username}` : walletCorta;
                     
                     fila.innerHTML = `
                         <td><strong>#${index + 1}</strong></td>
@@ -92,7 +109,8 @@
                     tbody.appendChild(fila);
                 });
             } catch (error) {
-                document.getElementById('tabla-body').innerHTML = '<tr><td colspan="4" class="loading" style="color:red;">Error al cargar el leaderboard</td></tr>';
+                console.error(error);
+                document.getElementById('tabla-body').innerHTML = '<tr><td colspan="4" class="loading" style="color:red;">Error al cargar el leaderboard real</td></tr>';
             }
         }
 
