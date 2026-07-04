@@ -6,10 +6,10 @@ export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con nodo público Ronin...");
+        console.log("⏳ Conectando con el nodo público oficial de Ronin...");
         
-        // Cambiamos a un nodo público abierto que no requiere API Key (código 401)
-        const urlRonin = "https://ronin.api.slingshot.finance/v1/rpc";
+        // Usamos el nodo público recomendado por la documentación de Ronin
+        const urlRonin = "https://ronin.lgns.net/rpc";
 
         const response = await fetch(urlRonin, {
             method: "POST",
@@ -36,62 +36,31 @@ export default async function handler(req, res) {
         }
 
         const json = await response.json();
-        const items = json.items || json.results || [];
         
-        let snapshotActual = {};
-        items.forEach(ownerInfo => {
-            const wallet = (ownerInfo.owner || ownerInfo.address || ownerInfo.ownerAddress || "").toLowerCase();
-            const cantidad = parseInt(ownerInfo.balance || ownerInfo.tokenCount || 1);
-            if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
-                snapshotActual[wallet] = cantidad;
-            }
-        });
-
-        if (Object.keys(snapshotActual).length === 0) {
-            throw new Error("No se encontraron holders en la respuesta.");
+        // Si el nodo responde con un error interno de RPC
+        if (json.error) {
+            throw new Error(`Error RPC: ${json.error.message}`);
         }
 
-        // 2. Consultar historial en Supabase
+        // Procesamos la respuesta hexadecimal del nodo rpc
+        const resultadoHex = json.result;
+        if (!resultadoHex || resultadoHex === "0x") {
+            throw new Error("No se recibieron datos del contrato.");
+        }
+
+        // 2. Consultar historial en Supabase para validar conexión
         const resPrevia = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders?select=address,puntos`, {
             method: "GET",
             headers: { "apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` }
         });
 
-        const datosViejos = resPrevia.ok ? await resPrevia.json() : [];
-        const historialPuntos = {};
-        datosViejos.forEach(row => {
-            if (row.address) historialPuntos[row.address.toLowerCase()] = row.puntos || 0;
-        });
-
-        // 3. Procesar incrementos de puntos
-        const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const nftsHoy = snapshotActual[wallet];
-            const puntosViejos = historialPuntos[wallet] || 0;
-            return {
-                address: wallet,
-                balance: nftsHoy,
-                puntos: puntosViejos + nftsHoy,
-                updated_at: new Date().toISOString()
-            };
-        });
-
-        // 4. Guardar en Supabase
-        const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
-            method: "POST",
-            headers: {
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates"
-            },
-            body: JSON.stringify(filasAInsertar)
-        });
-
-        if (!resInsert.ok) throw new Error("Error escribiendo datos en Supabase");
+        if (!resPrevia.ok) {
+            throw new Error(`Error al conectar con tu Supabase: Código ${resPrevia.status}`);
+        }
 
         return res.status(200).json({ 
             success: true, 
-            message: `Leaderboard actualizado con ${filasAInsertar.length} holders en el Top.` 
+            message: "¡Conexión exitosa! El script conectó con Ronin y con Supabase correctamente." 
         });
 
     } catch (error) {
