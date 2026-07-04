@@ -1,72 +1,78 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        if (!OPENSEA_API_KEY) {
-            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
-        }
+        console.log("⏳ Escaneando la blockchain de Ronin de inicio a fin...");
+        const urlRonin = "https://api.roninchain.com/rpc";
 
-        console.log("⏳ Descargando historial de eventos desde OpenSea...");
-        
-        // Buscamos los eventos de transferencia (transfer) del contrato en Ronin
-        const urlOpenSea = `https://api.opensea.io/api/v2/events/chain/ronin/contract/${contratoOgRats}?event_type=transfer&limit=50`;
-        
-        const responseOS = await fetch(urlOpenSea, {
-            method: "GET",
-            headers: { 
-                "Accept": "application/json",
-                "X-API-KEY": OPENSEA_API_KEY
-            }
+        // Consultamos los Logs nativos de transferencia desde el bloque 0 sin restricciones de rango
+        const responseRpc = await fetch(urlRonin, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "eth_getLogs",
+                params: [{
+                    address: contratoOgRats,
+                    fromBlock: "0x0", // Desde el bloque génesis de Ronin
+                    toBlock: "latest", // Hasta el bloque de este segundo
+                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"] // Evento Transfer estándar (ERC-721)
+                }]
+            })
         });
 
-        if (!responseOS.ok) {
-            throw new Error(`OpenSea API respondió con código: ${responseOS.status}`);
+        if (!responseRpc.ok) {
+            throw new Error(`El nodo de Ronin rechazó la conexión directa. Código: ${responseRpc.status}`);
         }
 
-        const jsonOS = await responseOS.json();
-        const asset_events = jsonOS.asset_events || [];
-        
-        if (asset_events.length === 0) {
-            throw new Error("OpenSea no registró eventos de transferencia recientes para este contrato.");
+        const jsonRpc = await responseRpc.json();
+        const logs = jsonRpc.result || [];
+
+        if (logs.length === 0) {
+            throw new Error("La blockchain no tiene registros de transferencias para este contrato. Verifica que el address del contrato sea el correcto.");
         }
 
         let snapshotActual = {};
 
-        // Procesamos los eventos reales
-        asset_events.forEach(event => {
-            const para = (event.to_address || "").toLowerCase();
-            const de = (event.from_address || "").toLowerCase();
+        // Reconstruimos el mapa exacto de holders procesando el historial
+        logs.forEach(log => {
+            if (log.topics.length >= 4) {
+                const de = "0x" + log.topics[1].slice(26).toLowerCase();
+                const para = "0x" + log.topics[2].slice(26).toLowerCase();
 
-            if (para && para !== "0x0000000000000000000000000000000000000000") {
-                if (!snapshotActual[para]) snapshotActual[para] = { balance: 0, username: null };
-                snapshotActual[para].balance += 1;
-            }
-            if (de && de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
-                snapshotActual[de].balance = Math.max(0, snapshotActual[de].balance - 1);
-                if (snapshotActual[de].balance === 0) delete snapshotActual[de];
+                // Sumamos al que recibe
+                if (para !== "0x0000000000000000000000000000000000000000") {
+                    snapshotActual[para] = (snapshotActual[para] || 0) + 1;
+                }
+                // Restamos al que envía
+                if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
+                    snapshotActual[de] = Math.max(0, snapshotActual[de] - 1);
+                    if (snapshotActual[de] === 0) delete snapshotActual[de];
+                }
             }
         });
 
-        if (Object.keys(snapshotActual).length === 0) {
-            throw new Error("No se pudieron extraer balances del historial de eventos.");
-        }
-
-        // Mapeamos para Supabase
+        // Formateamos las filas mapeando de forma limpia para tu tabla de Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
             return {
                 address: wallet,
                 username: null, 
-                balance: snapshotActual[wallet].balance,
-                puntos: snapshotActual[wallet].balance,
+                balance: snapshotActual[wallet],
+                puntos: snapshotActual[wallet], // 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
+        if (filasAInsertar.length === 0) {
+            throw new Error("No se pudieron generar holders netos con balances mayores a 0.");
+        }
+
+        // Enviamos todo a Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -83,10 +89,10 @@ export default async function handler(req, res) {
             throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
         }
 
-        return res.status(200).json({ 
-            success: true, 
-            message: "¡Sincronización mediante historial de eventos completada con éxito!",
-            holders_actualizados: filasAInsertar.length
+        return res.status(200).json({
+            success: true,
+            message: "¡Balances reales calculados directamente desde el contrato en Ronin!",
+            total_holders: filasAInsertar.length
         });
 
     } catch (error) {
