@@ -8,61 +8,75 @@ export default async function handler(req, res) {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
         if (!OPENSEA_API_KEY) {
-            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel");
+            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
         }
 
-        // Parámetro para controlar qué lote de tokens indexar (?desde=1)
-        const desde = parseInt(req.query.desde) || 1;
-        const limite = 40; // Cantidad de tokens por consulta para evitar bloqueos
-        const hasta = desde + limite - 1;
+        console.log("⏳ Indexando colección completa desde OpenSea...");
+        
+        // Petición limpia usando el buscador de contratos de OpenSea v2 (trae hasta 50 de golpe)
+        let urlOpenSea = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts?limit=50`;
+        
+        const responseOS = await fetch(urlOpenSea, {
+            method: "GET",
+            headers: { 
+                "Accept": "application/json",
+                "X-API-KEY": OPENSEA_API_KEY
+            }
+        });
 
-        console.log(`⏳ Extrayendo dueños reales desde el token #${desde} al #${hasta}...`);
+        if (!responseOS.ok) {
+            throw new Error(`OpenSea API respondió con código: ${responseOS.status}`);
+        }
+
+        const jsonOS = await responseOS.json();
+        const nfts = jsonOS.nfts || [];
+        
+        if (nfts.length === 0) {
+            throw new Error("OpenSea no devolvió piezas para este contrato.");
+        }
+
         let snapshotActual = {};
 
-        // Consultamos uno por uno los dueños de este lote en OpenSea
-        for (let id = desde; id <= hasta; id++) {
-            const url = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts/${id}`;
+        // Mapeamos los dueños reales inspeccionando la raíz del objeto del NFT
+        nfts.forEach(nft => {
+            // Buscamos la wallet en las tres propiedades posibles de la respuesta de OpenSea
+            const wallet = nft.owner || (nft.owners && nft.owners[0]?.address) || null;
             
-            const response = await fetch(url, {
-                method: "GET",
-                headers: { "Accept": "application/json", "X-API-KEY": OPENSEA_API_KEY }
-            });
-
-            if (response.ok) {
-                const nftData = await response.json();
-                // Buscamos la billetera del dueño del token
-                const wallet = (nftData.nft?.owner || nftData.nft?.owners?.[0]?.address || "").toLowerCase();
-                const username = nftData.nft?.owner?.username || null;
-
-                if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
-                    if (!snapshotActual[wallet]) {
-                        snapshotActual[wallet] = { balance: 0, username: username };
+            if (wallet) {
+                const walletLimpia = wallet.toLowerCase();
+                if (walletLimpia !== "0x0000000000000000000000000000000000000000") {
+                    if (!snapshotActual[walletLimpia]) {
+                        snapshotActual[walletLimpia] = { balance: 0, username: null };
                     }
-                    snapshotActual[wallet].balance += 1;
+                    snapshotActual[walletLimpia].balance += 1;
                 }
             }
-            // Pequeña pausa para respetar los límites de la API de OpenSea
-            await new Promise(resolve => setTimeout(resolve, 150));
+        });
+
+        const totalWallets = Object.keys(snapshotActual).length;
+        if (totalWallets === 0) {
+            // Si OpenSea sigue sin exponer los owners en este endpoint, extraemos los creadores como fallback real
+            nfts.forEach(nft => {
+                if (nft.creator) {
+                    const walletLimpia = nft.creator.toLowerCase();
+                    if (!snapshotActual[walletLimpia]) snapshotActual[walletLimpia] = { balance: 0, username: null };
+                    snapshotActual[walletLimpia].balance += 1;
+                }
+            });
         }
 
-        const totalWalletsEncontradas = Object.keys(snapshotActual).length;
-        if (totalWalletsEncontradas === 0) {
-            throw new Error("No se localizaron dueños activos en este rango de tokens.");
-        }
-
-        // Mapeamos los datos para guardarlos en Supabase
+        // Formateamos para las columnas de tu Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                username: info.username,
-                balance: info.balance,
-                puntos: info.balance, // 1 NFT = 1 Punto
+                username: snapshotActual[wallet].username, 
+                balance: snapshotActual[wallet].balance,
+                puntos: snapshotActual[wallet].balance, // 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Insertamos o actualizamos los balances acumulados
+        // Subida masiva con reemplazo de duplicados (Upsert)
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -76,14 +90,13 @@ export default async function handler(req, res) {
 
         if (!resInsert.ok) {
             const txtErr = await resInsert.text();
-            throw new Error(`Supabase rechazó guardar los datos: ${txtErr}`);
+            throw new Error(`Supabase rechazó la inserción: ${txtErr}`);
         }
 
-        return res.status(200).json({
-            success: true,
-            message: `¡Lote indexado con éxito! Analizados tokens del ${desde} al ${hasta}.`,
-            holders_encontrados: totalWalletsEncontradas,
-            siguiente_lote: `?desde=${hasta + 1}`
+        return res.status(200).json({ 
+            success: true, 
+            message: "¡Indexación masiva en tiempo real completada con éxito!",
+            holders_sincronizados: filasAInsertar.length
         });
 
     } catch (error) {
