@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OgRats Leaderboard</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121214;
+            color: #ffffff;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 { color: #f3ba2f; margin-bottom: 5px; }
+        p { color: #8a8d98; margin-top: 0; }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            background: #1a1b1f;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #2a2b31;
+        }
+        th { color: #f3ba2f; font-weight: 600; }
+        tr:hover { background-color: #222329; }
+        .loading { text-align: center; color: #8a8d98; padding: 20px; }
+    </style>
+</head>
+<body>
+
+    <h1>🏆 OgRats Leaderboard</h1>
+    <p>Suministro Total: 2222 NFTs</p>
+
+    <div class="container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Puesto</th>
+                    <th>Billetera</th>
+                    <th>Puntos</th>
+                </tr>
+            </thead>
+            <tbody id="tabla-body">
+                <tr>
+                    <td colspan="3" class="loading">Cargando clasificación...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        async function cargarLeaderboard() {
+            try {
+                // Llamamos a nuestra API para obtener los datos guardados
+                const response = await fetch('/api/ver-leaderboard');
+                const datos = await response.json();
+                
+                const tbody = document.getElementById('tabla-body');
+                tbody.innerHTML = '';
+
+                if (datos.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3" class="loading">No hay datos todavía.</td></tr>';
+                    return;
+                }
+
+                datos.forEach((user, index) => {
+                    const fila = document.createElement('tr');
+                    // Recortamos la wallet para que se vea bien en el móvil (Ej: 0x1234...abcd)
+                    const walletCorta = user.address.substring(0, 6) + '...' + user.address.substring(user.address.length - 4);
+                    
+                    fila.innerHTML = `
+                        <td><strong>#${index + 1}</strong></td>
+                        <td>${walletCorta}</td>
+                        <td>${user.puntos} pts</td>
+                    `;
+                    tbody.appendChild(fila);
+                });
+            } catch (error) {
+                document.getElementById('tabla-body').innerHTML = '<tr><td colspan="3" class="loading" style="color:red;">Error al cargar el leaderboard</td></tr>';
+            }
+        }
+
+        cargarLeaderboard();
+    </script>
+</body>
+</html>
