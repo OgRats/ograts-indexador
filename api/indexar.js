@@ -1,7 +1,6 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
-const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
     try {
@@ -11,10 +10,10 @@ export default async function handler(req, res) {
             throw new Error("Falta la variable OPENSEA_API_KEY en Vercel (Production)");
         }
 
-        console.log("⏳ Descargando holders reales desde el endpoint de contrato de OpenSea...");
+        console.log("⏳ Consultando el listado directo de dueños de la colección en OpenSea...");
         
-        // Endpoint v2 correcto para contratos en Ronin que sí incluye los owners e información de cuenta
-        const urlOpenSea = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts?limit=50`;
+        // Endpoint v2 oficial de OpenSea exclusivo para listar los dueños (owners) de una colección
+        const urlOpenSea = "https://api.opensea.io/api/v2/collections/ograts/owners?limit=150";
         
         const responseOS = await fetch(urlOpenSea, {
             method: "GET",
@@ -29,58 +28,53 @@ export default async function handler(req, res) {
         }
 
         const jsonOS = await responseOS.json();
-        const nfts = jsonOS.nfts || [];
         
-        if (nfts.length === 0) {
-            throw new Error("OpenSea no devolvió ítems para este contrato. Verifica el estado de indexación en la plataforma.");
+        // La API v2 para este endpoint devuelve la lista dentro de jsonOS.owners
+        const ownersList = jsonOS.owners || [];
+        
+        if (ownersList.length === 0) {
+            throw new Error("OpenSea respondió 200, pero la lista 'owners' vino vacía. Comprueba el slug de la colección.");
         }
 
         let snapshotActual = {};
 
-        // Mapeamos los campos de dueños que este endpoint específico sí retorna
-        nfts.forEach(nft => {
-            let walletDetectada = null;
-            let usernameDetectado = null;
+        // Recorremos la lista estructurada de dueños que devuelve OpenSea
+        ownersList.forEach(ownerData => {
+            // En este endpoint, la wallet viene directo en ownerData.owner o ownerData.address
+            const wallet = (ownerData.owner || ownerData.address || "").toLowerCase();
+            const cantidad = parseInt(ownerData.quantity || 0);
+            
+            if (wallet && wallet !== "0x0000000000000000000000000000000000000000" && cantidad > 0) {
+                // OpenSea asocia el nombre de usuario de la cuenta si existe
+                const username = ownerData.username || null;
 
-            if (nft.owner) {
-                walletDetectada = typeof nft.owner === 'string' ? nft.owner : (nft.owner.address || nft.owner.wallet);
-                usernameDetectado = nft.owner.username || null;
-            } else if (nft.owners && nft.owners.length > 0) {
-                walletDetectada = nft.owners[0].address;
-                usernameDetectado = nft.owners[0].username || null;
-            }
-
-            if (walletDetectada) {
-                const walletLimpia = walletDetectada.toLowerCase();
-                if (walletLimpia !== "0x0000000000000000000000000000000000000000") {
-                    if (!snapshotActual[walletLimpia]) {
-                        snapshotActual[walletLimpia] = {
-                            balance: 0,
-                            username: usernameDetectado || null
-                        };
-                    }
-                    snapshotActual[walletLimpia].balance += 1;
+                if (!snapshotActual[wallet]) {
+                    snapshotActual[wallet] = {
+                        balance: 0,
+                        username: username
+                    };
                 }
+                snapshotActual[wallet].balance += cantidad;
             }
         });
 
         if (Object.keys(snapshotActual).length === 0) {
-            throw new Error("Este endpoint no retornó información de owners mapeable.");
+            throw new Error("No se pudieron mapear los campos 'owner' o 'quantity' de la respuesta.");
         }
 
-        // Estructuramos las filas idénticas para Supabase
+        // Formateamos las filas idénticas para Supabase
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
             const info = snapshotActual[wallet];
             return {
                 address: wallet,
                 username: info.username, 
                 balance: info.balance,
-                puntos: info.balance, // 1 NFT = 1 Punto
+                puntos: info.balance, // Regla de oro: 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Upsert limpio en Supabase
+        // Insertamos o actualizamos de golpe en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -99,7 +93,7 @@ export default async function handler(req, res) {
 
         return res.status(200).json({ 
             success: true, 
-            message: "¡Sincronización real completada con éxito!",
+            message: "¡Sincronización real de holders completada!",
             holders_actualizados: filasAInsertar.length
         });
 
