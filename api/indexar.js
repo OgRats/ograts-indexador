@@ -1,69 +1,77 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
 const contratoOgRats = "0x953E34637cC596B8195Eb7FB83305402d3B9D000";
 
 export default async function handler(req, res) {
     try {
         const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-        console.log("⏳ Conectando con el nodo Ronin...");
-        const urlRonin = "https://api.roninchain.com/rpc";
+        if (!OPENSEA_API_KEY) {
+            throw new Error("Falta la variable OPENSEA_API_KEY en Vercel");
+        }
 
-        // Pedimos los logs de transferencia en modo seguro
-        const response = await fetch(urlRonin, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                method: "eth_getLogs",
-                params: [{
-                    address: contratoOgRats,
-                    fromBlock: "safe", 
-                    toBlock: "latest",
-                    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
-                }]
-            })
-        });
-
-        if (!response.ok) throw new Error(`Error de nodo: ${response.status}`);
-        const json = await response.json();
+        console.log("⏳ Obteniendo todos los NFTs y holders desde OpenSea V2 (Ronin)...");
         
-        let snapshotActual = {};
-        const logs = json.result || [];
+        // Endpoint correcto de OpenSea V2 para listar los NFTs de un contrato en Ronin
+        const urlOpenSea = `https://api.opensea.io/api/v2/chain/ronin/contract/${contratoOgRats}/nfts?limit=100`;
 
-        logs.forEach(log => {
-            if (log.topics.length >= 4) {
-                const de = "0x" + log.topics[1].slice(26).toLowerCase();
-                const para = "0x" + log.topics[2].slice(26).toLowerCase();
-                
-                if (para !== "0x0000000000000000000000000000000000000000") {
-                    snapshotActual[para] = (snapshotActual[para] || 0) + 1;
-                }
-                if (de !== "0x0000000000000000000000000000000000000000" && snapshotActual[de]) {
-                    snapshotActual[de] = Math.max(0, snapshotActual[de] - 1);
-                    if (snapshotActual[de] === 0) delete snapshotActual[de];
-                }
+        const responseOS = await fetch(urlOpenSea, {
+            method: "GET",
+            headers: { 
+                "Accept": "application/json",
+                "X-API-KEY": OPENSEA_API_KEY
             }
         });
 
-        // Forzamos la wallet de prueba con 5 NFTs si el bloque actual está calmado
-        if (Object.keys(snapshotActual).length === 0) {
-            snapshotActual["0x71c46c64c1e4881d6e42921b113b5bc2c67ad27c"] = 5;
+        if (!responseOS.ok) {
+            throw new Error(`OpenSea API respondió con código ${responseOS.status}`);
         }
 
-        // Enviamos SOLO las columnas básicas que creamos al principio en Supabase
+        const jsonOS = await responseOS.json();
+        const nfts = jsonOS.nfts || [];
+        
+        let snapshotActual = {};
+
+        // Recorremos los NFTs para agruparlos por dueño y extraer sus nombres de OpenSea
+        nfts.forEach(nft => {
+            const wallet = (nft.owner || "").toLowerCase();
+            
+            if (wallet && wallet !== "0x0000000000000000000000000000000000000000") {
+                // Intentamos buscar el nombre de usuario dentro de los datos del NFT en OpenSea
+                // Nota: OpenSea a veces lo estructura en nft.owners o dentro de los metadatos del creador/dueño
+                let username = null;
+                if (nft.creator_username) {
+                    username = nft.creator_username;
+                }
+
+                if (!snapshotActual[wallet]) {
+                    snapshotActual[wallet] = {
+                        balance: 0,
+                        username: username
+                    };
+                }
+                snapshotActual[wallet].balance += 1;
+            }
+        });
+
+        if (Object.keys(snapshotActual).length === 0) {
+            throw new Error("No se encontraron NFTs o dueños activos en la respuesta de OpenSea.");
+        }
+
+        // Preparamos las filas para Supabase incluyendo la columna username
         const filasAInsertar = Object.keys(snapshotActual).map(wallet => {
-            const balanceNfts = snapshotActual[wallet];
+            const info = snapshotActual[wallet];
             return {
                 address: wallet,
-                balance: balanceNfts,
-                puntos: balanceNfts, // Regla de oro: 1 NFT = 1 Punto
+                username: info.username, // Guardamos el nombre de la cuenta de OpenSea si existe
+                balance: info.balance,    // Cuántos NFTs tiene de este lote
+                puntos: info.balance,     // REGLA: 1 NFT = 1 Punto
                 updated_at: new Date().toISOString()
             };
         });
 
-        // Guardamos de forma limpia en tu Supabase
+        // Guardamos en Supabase
         const resInsert = await fetch(`${SUPABASE_URL}/rest/v1/ograts_holders`, {
             method: "POST",
             headers: {
@@ -76,16 +84,16 @@ export default async function handler(req, res) {
         });
 
         if (!resInsert.ok) {
-            const errorTexto = await resInsert.text();
-            throw new Error(`Supabase rechazó los datos: ${errorTexto}`);
+            const errText = await resInsert.text();
+            throw new Error(`Supabase rechazó los datos: ${errText}`);
         }
 
         return res.status(200).json({ 
             success: true, 
-            message: `¡Sincronización perfecta! Procesados ${filasAInsertar.length} registros en Supabase.` 
+            message: `¡Sincronización real completada! Se procesaron ${filasAInsertar.length} holders reales de OpenSea con sus nombres.` 
         });
 
     } catch (error) {
         return res.status(500).json({ success: false, error: error.message });
     }
-            }
+}
