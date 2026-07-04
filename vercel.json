@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/indexar",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
